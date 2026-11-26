@@ -35,3 +35,10 @@ at 320×180). This is an approximate mapping, not UniFi's detector algorithm.
 
 Basic motion uses native `EventSmartMotion` start/stop messages independently
 of Person, Vehicle and Animal events. Heatmaps are not currently generated.
+
+## Bind the HTTP listeners
+
+Use `--http-bind-address 127.0.0.1` with `--http-api` or
+`--ai-sink-port` when the caller runs on the same host. These endpoints
+do not authenticate callers. A bundled sidecar's detection input remains
+loopback-only.
