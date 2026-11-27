@@ -78,10 +78,6 @@ class RTSPCam(UnifiCamBase):
         parser.add_argument("--match-recording-frames", action="store_true",
                             help="Match external H.264 picture IDs to the primary stream")
         parser.add_argument(
-            "--single-channel", action="store_true",
-            help="Advertise and publish only the primary video channel",
-        )
-        parser.add_argument(
             "--external-detector", action="store_true",
             help="Expose Protect settings on the loopback AI sink (--ai-sink-port)",
         )
