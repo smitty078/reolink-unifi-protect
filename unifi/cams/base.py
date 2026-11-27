@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shlex
+import secrets
 import shutil
 import signal
 import ssl
@@ -692,6 +693,8 @@ class UnifiCamBase(metaclass=ABCMeta):
         confidence: float,
         tracker_id: int,
         zones: Optional[list] = None,
+        *,
+        frame_wall_ms: Optional[int] = None,
     ) -> dict[str, Any]:
         # Shape per Protect 7.x's smartDetectObjectsTransformMessage
         # schema, field for field what a real G5's frames carry (read from ds's
@@ -702,7 +705,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         seen = self.__dict__.setdefault("_first_shown_ms", {})
         if len(seen) > 256:
             seen.clear()
-        first_shown = seen.setdefault(int(tracker_id), now_ms)
+        first_shown = seen.setdefault(int(tracker_id), frame_wall_ms or now_ms)
         return {
             "trackerID": int(tracker_id),
             "name": "",
@@ -1968,13 +1971,19 @@ class UnifiCamBase(metaclass=ABCMeta):
             hevc_filter = ""
             if self._emits_h265(stream_index):
                 hevc_filter = f"{sys.executable} -m unifi.hevc_flv | "
+            frame_clock = ""
+            frames = getattr(self, "_recording_frames", None)
+            if stream_index == "video1" and frames is not None:
+                worker = secrets.token_bytes(16)
+                frames.reset(worker)
+                frame_clock = f" --frame-clock {self._frame_clock_port} {worker.hex()}"
             cmd = (
                 "ffmpeg -nostdin -loglevel error -y"
                 f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
                 f" {self.args.rtsp_transport} -i {shlex.quote(source)}"
                 f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
                 f" streamName={stream_name} -f flv - | {hevc_filter}{sys.executable} -m"
-                " unifi.clock_sync"
+                f" unifi.clock_sync{frame_clock}"
                 f" {'--write-timestamps' if self._needs_flv_timestamps else ''} | nc"
                 f" {destination[0]} {destination[1]}"
             )
