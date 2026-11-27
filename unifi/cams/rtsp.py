@@ -103,6 +103,13 @@ class RTSPCam(UnifiCamBase):
             help="Specify a port number to enable the HTTP API (default: disabled)",
         )
         parser.add_argument(
+            "--detector-thumbnail-port",
+            type=int,
+            choices=range(1, 65536),
+            metavar="PORT",
+            help="Read detection frame images from a configured loopback detector port",
+        )
+        parser.add_argument(
             "--snapshot-url",
             "-i",
             default=None,
@@ -550,6 +557,9 @@ class RTSPCam(UnifiCamBase):
         stamp = data.get("frameWallMs")
         if stamp is not None and (type(stamp) is not int or stamp <= 0):
             return web.Response(status=400, text="frameWallMs must be epoch milliseconds")
+        reference = data.get("frameReadNs")
+        if reference is not None and (type(reference) is not int or not 0 < reference < 10**20):
+            return web.Response(status=400, text="invalid frameReadNs")
         picture_id = data.get("pictureId")
         if picture_id is not None and self._recording_frames is not None:
             if not isinstance(picture_id, str) or len(picture_id) != 64:
@@ -563,7 +573,9 @@ class RTSPCam(UnifiCamBase):
                 return web.Response(status=204)
             self._last_picture_stamp = stamp
         try:
-            await self._on_ai_boxes(data.get("boxes") or [], frame_wall_ms=stamp)
+            await self._on_ai_boxes(
+                data.get("boxes") or [], frame_wall_ms=stamp, snapshot_reference=reference
+            )
         except Exception:
             self.logger.exception("Failed to process AI box report")
         return web.Response(text="ok")
@@ -686,7 +698,8 @@ class RTSPCam(UnifiCamBase):
         return overrides.get(kind, self.args.ai_min_confidence)
 
     async def _on_ai_boxes(
-        self, boxes: list, *, frame_wall_ms: Optional[int] = None
+        self, boxes: list, *, frame_wall_ms: Optional[int] = None,
+        snapshot_reference: Optional[int] = None,
     ) -> None:
         self._sink_last_ts = time.time()
         if self._enrich_only() and not self._motion_event_ts:
@@ -792,7 +805,8 @@ class RTSPCam(UnifiCamBase):
                     made.add(d["trackerID"])
                     asyncio.create_task(
                         self._make_object_crop(
-                            d["trackerID"], d["objectType"], d["coord"]
+                            d["trackerID"], d["objectType"], d["coord"],
+                            snapshot_reference=snapshot_reference,
                         )
                     )
         elif (
@@ -805,7 +819,32 @@ class RTSPCam(UnifiCamBase):
             await self.trigger_motion_stop()
             self._ai_active_lead = None
 
-    async def _make_object_crop(self, tracker_id: int, kind: str, coord: list) -> None:
+    async def _fetch_detector_frame(self, reference, destination):
+        port = getattr(self.args, "detector_thumbnail_port", None)
+        if port is None or reference is None:
+            return False
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1)) as session:
+                url = f"http://127.0.0.1:{port}/frame/{reference}"
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status != 200 or response.content_type != "image/jpeg":
+                        return False
+                    limit = 4 * 1024 * 1024
+                    image = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        image.extend(chunk)
+                        if len(image) > limit:
+                            return False
+                    if not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+                        return False
+                    destination.write_bytes(image)
+                    return True
+        except (aiohttp.ClientError, TimeoutError, OSError):
+            return False
+
+    async def _make_object_crop(
+        self, tracker_id: int, kind: str, coord: list, *, snapshot_reference=None
+    ) -> None:
         """Square crop around one detection, from a fresh camera snapshot.
 
         Announced via smartDetectSnapshots at event stop; Protect fetches
@@ -815,7 +854,9 @@ class RTSPCam(UnifiCamBase):
         """
         fetched = Path(self.snapshot_dir, f"crop_src_{tracker_id}.jpg")
         try:
-            if self._http_snapshots():
+            if await self._fetch_detector_frame(snapshot_reference, fetched):
+                src = fetched
+            elif self._http_snapshots():
                 if not await self._fetch_snapshot(fetched):
                     return
                 src = fetched
