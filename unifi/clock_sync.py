@@ -3,12 +3,15 @@ Helper program to inject absolute wall clock time into FLV stream for recordings
 """
 
 import argparse
+import socket
 import sys
 import time
 
 from flvlib3.astypes import FLVObject
 from flvlib3.primitives import make_ui8, make_ui32
 from flvlib3.tags import create_script_tag
+
+from unifi.recording_frames import FRAME_NOTICE, picture_key
 
 
 def read_bytes(source, num_bytes):
@@ -67,6 +70,10 @@ def main(args):
 
     last_sync = None
     origin_ms = None
+    publisher = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if args.frame_clock else None
+    if publisher is not None:
+        publisher.setblocking(False)
+        port, worker = args.frame_clock
     while True:
         header = read_bytes(source, 11)
         if not header:
@@ -144,6 +151,16 @@ def main(args):
         write(payload)
         write(previous_size)
         write_timestamp_trailer(rate, ticks)
+        if publisher is not None and is_video_picture and payload[0] & 15 == 7:
+            key = picture_key(payload[5:])
+            if key is not None:
+                try:
+                    publisher.sendto(
+                        FRAME_NOTICE.pack(bytes.fromhex(worker), key, origin_ms + presentation_ms),
+                        ("127.0.0.1", int(port)),
+                    )
+                except OSError:
+                    pass
 
 
 
@@ -154,6 +171,7 @@ def parse_args():
         action="store_true",
         help="Indicates we should write timestamp in between packets",
     )
+    parser.add_argument("--frame-clock", nargs=2, metavar=("PORT", "WORKER"))
     return parser.parse_args()
 
 

@@ -14,6 +14,7 @@ import aiohttp
 from aiohttp import web
 
 from unifi.cams.base import SmartDetectObjectType, UnifiCamBase, jpeg_size
+from unifi.recording_frames import RecordingFrames
 from unifi.reolink_isp import ReolinkIsp
 from unifi.reolink_light import ReolinkLight
 from unifi.reolink_ptz import ReolinkPtz
@@ -44,6 +45,10 @@ class RTSPCam(UnifiCamBase):
             self.zone_motion = ZoneMotion(self)
         self.runner = None
         self.sink_runner = None
+        self._recording_frames = None
+        self._frame_clock_transport = None
+        self._frame_clock_port = None
+        self._last_picture_stamp = 0
         self._detector_settings = {}
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
@@ -64,6 +69,8 @@ class RTSPCam(UnifiCamBase):
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
         super().add_parser(parser)
+        parser.add_argument("--match-recording-frames", action="store_true",
+                            help="Match external H.264 picture IDs to the primary stream")
         parser.add_argument(
             "--single-channel", action="store_true",
             help="Advertise and publish only the primary video channel",
@@ -358,6 +365,16 @@ class RTSPCam(UnifiCamBase):
         return web.json_response(self._detector_settings)
 
     async def run(self) -> None:
+        if getattr(self.args, "match_recording_frames", False):
+            if not self.args.ai_sink_port or not getattr(self.args, "external_detector", False):
+                raise ValueError("Frame matching requires the loopback external detector sink")
+            if self._hw_transcoding("video1") or self.args.hi_codec != "h264":
+                raise ValueError("Frame matching requires H.264 primary stream copy")
+            self._recording_frames = RecordingFrames()
+            self._frame_clock_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: self._recording_frames, local_addr=("127.0.0.1", 0)
+            )
+            self._frame_clock_port = self._frame_clock_transport.get_extra_info("sockname")[1]
         if self.args.http_api:
             self.logger.info(f"Enabling HTTP API on port {self.args.http_api}")
 
@@ -533,6 +550,18 @@ class RTSPCam(UnifiCamBase):
         stamp = data.get("frameWallMs")
         if stamp is not None and (type(stamp) is not int or stamp <= 0):
             return web.Response(status=400, text="frameWallMs must be epoch milliseconds")
+        picture_id = data.get("pictureId")
+        if picture_id is not None and self._recording_frames is not None:
+            if not isinstance(picture_id, str) or len(picture_id) != 64:
+                return web.Response(status=400, text="invalid pictureId")
+            try:
+                key = bytes.fromhex(picture_id)
+            except ValueError:
+                return web.Response(status=400, text="invalid pictureId")
+            stamp = await self._recording_frames.resolve(key)
+            if stamp is None or stamp <= self._last_picture_stamp:
+                return web.Response(status=204)
+            self._last_picture_stamp = stamp
         try:
             await self._on_ai_boxes(data.get("boxes") or [], frame_wall_ms=stamp)
         except Exception:
@@ -711,6 +740,7 @@ class RTSPCam(UnifiCamBase):
                     confidence,
                     box.get("track_id", 9000 + i),
                     zones=zone_ids,
+                    frame_wall_ms=frame_wall_ms,
                 )
             )
         if descriptors:
@@ -1278,6 +1308,9 @@ class RTSPCam(UnifiCamBase):
             self.snapshot_stream = None
 
     async def close(self) -> None:
+        if self._frame_clock_transport is not None:
+            self._recording_frames.reset()
+            self._frame_clock_transport.close()
         self._stop_snapshot_stream()
         await super().close()
         if self.runner:
